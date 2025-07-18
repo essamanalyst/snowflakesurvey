@@ -1,439 +1,344 @@
-import sqlite3
 import streamlit as st
+import snowflake.connector
 import json
-from typing import Optional, List, Tuple, Dict
+import pandas as pd
 from datetime import datetime
-from pathlib import Path
-BASE_DIR = Path(__file__).parent
-DATABASE_DIR = BASE_DIR / "data"
-DATABASE_DIR.mkdir(exist_ok=True)  
-DATABASE_PATH = str(DATABASE_DIR / "survey_app.db")
+from typing import Optional, List, Tuple, Dict
+import os
+from dotenv import load_dotenv
+
+# تحميل متغيرات البيئة
+load_dotenv()
+
+# إعدادات اتصال Snowflake
+SNOWFLAKE_ACCOUNT = os.getenv('SNOWFLAKE_ACCOUNT')
+SNOWFLAKE_USER = os.getenv('SNOWFLAKE_USER')
+SNOWFLAKE_PASSWORD = os.getenv('SNOWFLAKE_PASSWORD')
+SNOWFLAKE_DATABASE = os.getenv('SNOWFLAKE_DATABASE', 'SURVEY_APP')
+SNOWFLAKE_SCHEMA = os.getenv('SNOWFLAKE_SCHEMA', 'PUBLIC')
+SNOWFLAKE_WAREHOUSE = os.getenv('SNOWFLAKE_WAREHOUSE', 'COMPUTE_WH')
+
+def get_snowflake_connection():
+    """إنشاء اتصال بـ Snowflake"""
+    try:
+        conn = snowflake.connector.connect(
+            user=SNOWFLAKE_USER,
+            password=SNOWFLAKE_PASSWORD,
+            account=SNOWFLAKE_ACCOUNT,
+            warehouse=SNOWFLAKE_WAREHOUSE,
+            database=SNOWFLAKE_DATABASE,
+            schema=SNOWFLAKE_SCHEMA
+        )
+        return conn
+    except Exception as e:
+        st.error(f"فشل الاتصال بـ Snowflake: {str(e)}")
+        return None
 
 def init_db():
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
+    """تهيئة قاعدة البيانات وجداولها"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
     
-    # Create Users table
-    c.execute('''CREATE TABLE IF NOT EXISTS Users
-                 (user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  username TEXT UNIQUE NOT NULL,
-                  password_hash TEXT NOT NULL,
-                  role TEXT NOT NULL,
-                  assigned_region INTEGER,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  last_login TIMESTAMP,
-                  FOREIGN KEY(assigned_region) REFERENCES Regions(region_id))''')
-    
-    # Create Governorates table
-    c.execute('''CREATE TABLE IF NOT EXISTS Governorates
-                 (governorate_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  governorate_name TEXT NOT NULL UNIQUE,
-                  description TEXT)''')
-    
-    # Create Regions table (with governorate relationship)
-    c.execute('''CREATE TABLE IF NOT EXISTS HealthAdministrations
-             (admin_id INTEGER PRIMARY KEY AUTOINCREMENT,
-              admin_name TEXT NOT NULL,
-              description TEXT,
-              governorate_id INTEGER NOT NULL,
-              FOREIGN KEY(governorate_id) REFERENCES Governorates(governorate_id),
-              UNIQUE(admin_name, governorate_id))''')
-             
-    # Create Surveys table
-    c.execute('''CREATE TABLE IF NOT EXISTS Surveys
-                 (survey_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  survey_name TEXT NOT NULL,
-                  created_by INTEGER NOT NULL,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  is_active BOOLEAN DEFAULT TRUE,
-                  FOREIGN KEY(created_by) REFERENCES Users(user_id))''')
-    
-    # Create Survey_Fields table
-    c.execute('''CREATE TABLE IF NOT EXISTS Survey_Fields
-                 (field_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  survey_id INTEGER NOT NULL,
-                  field_type TEXT NOT NULL,
-                  field_label TEXT NOT NULL,
-                  field_options TEXT,
-                  is_required BOOLEAN DEFAULT FALSE,
-                  field_order INTEGER NOT NULL,
-                  FOREIGN KEY(survey_id) REFERENCES Surveys(survey_id))''')
-    
-    # Create Responses table
-    c.execute('''CREATE TABLE IF NOT EXISTS Responses
-                 (response_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  survey_id INTEGER NOT NULL,
-                  user_id INTEGER NOT NULL,
-                  region_id INTEGER NOT NULL,
-                  submission_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  is_completed BOOLEAN DEFAULT FALSE,
-                  FOREIGN KEY(survey_id) REFERENCES Surveys(survey_id),
-                  FOREIGN KEY(user_id) REFERENCES Users(user_id),
-                  FOREIGN KEY(region_id) REFERENCES Regions(region_id))''')
-    
-    # Create Response_Details table
-    c.execute('''CREATE TABLE IF NOT EXISTS Response_Details
-                 (detail_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  response_id INTEGER NOT NULL,
-                  field_id INTEGER NOT NULL,
-                  answer_value TEXT,
-                  FOREIGN KEY(response_id) REFERENCES Responses(response_id),
-                  FOREIGN KEY(field_id) REFERENCES Survey_Fields(field_id))''')
-                 
-    c.execute('''CREATE TABLE IF NOT EXISTS GovernorateAdmins
-             (admin_id INTEGER PRIMARY KEY AUTOINCREMENT,
-              user_id INTEGER NOT NULL,
-              governorate_id INTEGER NOT NULL,
-              FOREIGN KEY(user_id) REFERENCES Users(user_id),
-              FOREIGN KEY(governorate_id) REFERENCES Governorates(governorate_id),
-              UNIQUE(user_id, governorate_id))''')
-             
-             
-    c.execute('''CREATE TABLE IF NOT EXISTS UserSurveys
-             (id INTEGER PRIMARY KEY AUTOINCREMENT,
-              user_id INTEGER NOT NULL,
-              survey_id INTEGER NOT NULL,
-              FOREIGN KEY(user_id) REFERENCES Users(user_id),
-              FOREIGN KEY(survey_id) REFERENCES Surveys(survey_id),
-              UNIQUE(user_id, survey_id))''')        
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS SurveyGovernorate
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  survey_id INTEGER NOT NULL,
-                  governorate_id INTEGER NOT NULL,
-                  FOREIGN KEY(survey_id) REFERENCES Surveys(survey_id),
-                  FOREIGN KEY(governorate_id) REFERENCES Governorates(governorate_id),
-                  UNIQUE(survey_id, governorate_id))''')    
-                 
-                 
-    c.execute('''CREATE TABLE IF NOT EXISTS AuditLog
-             (log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-              user_id INTEGER NOT NULL,
-              action_type TEXT NOT NULL,
-              table_name TEXT NOT NULL,
-              record_id INTEGER,
-              old_value TEXT,
-              new_value TEXT,
-              action_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-              FOREIGN KEY(user_id) REFERENCES Users(user_id))''')             
-    # Add default admin user if none exists
-    c.execute("SELECT COUNT(*) FROM Users WHERE role='admin'")
-    if c.fetchone()[0] == 0:
-        from auth import hash_password
-        admin_password = hash_password("admin123")
-        c.execute("INSERT INTO Users (username, password_hash, role) VALUES (?, ?, ?)",
-                  ("admin", admin_password, "admin"))
-    
-    conn.commit()
-    conn.close()
-
-def get_user_by_username(username):
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM Users WHERE username=?", (username,))
-    user = c.fetchone()
-    conn.close()
-    
-    if user:
-        return {
-            'user_id': user[0],
-            'username': user[1],
-            'password_hash': user[2],
-            'role': user[3],
-            'assigned_region': user[4],
-            'created_at': user[5],
-            'last_login': user[6]
-        }
-    return None
-
-def get_user_role(user_id):
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("SELECT role FROM Users WHERE user_id=?", (user_id,))
-    role = c.fetchone()
-    conn.close()
-    return role[0] if role else None
-
-
-
-def get_health_admins():
-    """استرجاع جميع الإدارات الصحية من قاعدة البيانات"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("SELECT admin_id, admin_name FROM HealthAdministrations")
-    admins = c.fetchall()
-    conn.close()
-    return admins
-
-def get_health_admin_name(admin_id):
-    """استرجاع اسم الإدارة الصحية بناءً على المعرف"""
-    if admin_id is None:
-        return "غير معين"
-    
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
     try:
-        c.execute("SELECT admin_name FROM HealthAdministrations WHERE admin_id=?", (admin_id,))
-        result = c.fetchone()
-        return result[0] if result else "غير معروف"
-    except sqlite3.Error as e:
-        print(f"خطأ في جلب اسم الإدارة الصحية: {e}")
-        return "خطأ في النظام"
-    finally:
-        conn.close()        
+        cursor = conn.cursor()
         
-def save_response(survey_id, user_id, region_id, is_completed=False):
-    """حفظ استجابة جديدة في قاعدة البيانات"""
-    conn = None
-    try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        
-        c.execute(
-            '''INSERT INTO Responses 
-               (survey_id, user_id, region_id, is_completed) 
-               VALUES (?, ?, ?, ?)''',
-            (survey_id, user_id, region_id, is_completed)
+        # إنشاء الجداول إذا لم تكن موجودة
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Users (
+            user_id INTEGER AUTOINCREMENT PRIMARY KEY,
+            username VARCHAR(255) NOT NULL UNIQUE,
+            password_hash VARCHAR(255) NOT NULL,
+            role VARCHAR(50) NOT NULL,
+            assigned_region INTEGER,
+            created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+            last_login TIMESTAMP_NTZ,
+            last_activity TIMESTAMP_NTZ
         )
-        response_id = c.lastrowid
+        """)
+        
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Governorates (
+            governorate_id INTEGER AUTOINCREMENT PRIMARY KEY,
+            governorate_name VARCHAR(255) NOT NULL UNIQUE,
+            description TEXT
+        )
+        """)
+        
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS HealthAdministrations (
+            admin_id INTEGER AUTOINCREMENT PRIMARY KEY,
+            admin_name VARCHAR(255) NOT NULL,
+            description TEXT,
+            governorate_id INTEGER NOT NULL,
+            FOREIGN KEY (governorate_id) REFERENCES Governorates(governorate_id),
+            UNIQUE (admin_name, governorate_id)
+        )
+        """)
+        
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Surveys (
+            survey_id INTEGER AUTOINCREMENT PRIMARY KEY,
+            survey_name VARCHAR(255) NOT NULL,
+            created_by INTEGER NOT NULL,
+            created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+            is_active BOOLEAN DEFAULT TRUE,
+            FOREIGN KEY (created_by) REFERENCES Users(user_id)
+        )
+        """)
+        
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Survey_Fields (
+            field_id INTEGER AUTOINCREMENT PRIMARY KEY,
+            survey_id INTEGER NOT NULL,
+            field_type VARCHAR(50) NOT NULL,
+            field_label VARCHAR(255) NOT NULL,
+            field_options TEXT,
+            is_required BOOLEAN DEFAULT FALSE,
+            field_order INTEGER NOT NULL,
+            FOREIGN KEY (survey_id) REFERENCES Surveys(survey_id)
+        )
+        """)
+        
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Responses (
+            response_id INTEGER AUTOINCREMENT PRIMARY KEY,
+            survey_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            region_id INTEGER NOT NULL,
+            submission_date TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+            is_completed BOOLEAN DEFAULT FALSE,
+            FOREIGN KEY (survey_id) REFERENCES Surveys(survey_id),
+            FOREIGN KEY (user_id) REFERENCES Users(user_id),
+            FOREIGN KEY (region_id) REFERENCES HealthAdministrations(admin_id)
+        )
+        """)
+        
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS Response_Details (
+            detail_id INTEGER AUTOINCREMENT PRIMARY KEY,
+            response_id INTEGER NOT NULL,
+            field_id INTEGER NOT NULL,
+            answer_value TEXT,
+            FOREIGN KEY (response_id) REFERENCES Responses(response_id),
+            FOREIGN KEY (field_id) REFERENCES Survey_Fields(field_id)
+        )
+        """)
+        
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS GovernorateAdmins (
+            admin_id INTEGER AUTOINCREMENT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            governorate_id INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES Users(user_id),
+            FOREIGN KEY (governorate_id) REFERENCES Governorates(governorate_id),
+            UNIQUE (user_id, governorate_id)
+        )
+        """)
+        
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS UserSurveys (
+            id INTEGER AUTOINCREMENT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            survey_id INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES Users(user_id),
+            FOREIGN KEY (survey_id) REFERENCES Surveys(survey_id),
+            UNIQUE (user_id, survey_id)
+        )
+        """)
+        
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS SurveyGovernorate (
+            id INTEGER AUTOINCREMENT PRIMARY KEY,
+            survey_id INTEGER NOT NULL,
+            governorate_id INTEGER NOT NULL,
+            FOREIGN KEY (survey_id) REFERENCES Surveys(survey_id),
+            FOREIGN KEY (governorate_id) REFERENCES Governorates(governorate_id),
+            UNIQUE (survey_id, governorate_id)
+        )
+        """)
+        
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS AuditLog (
+            log_id INTEGER AUTOINCREMENT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            action_type VARCHAR(50) NOT NULL,
+            table_name VARCHAR(255) NOT NULL,
+            record_id INTEGER,
+            old_value TEXT,
+            new_value TEXT,
+            action_timestamp TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+            FOREIGN KEY (user_id) REFERENCES Users(user_id)
+        )
+        """)
+        
+        # إضافة مستخدم admin افتراضي إذا لم يكن موجوداً
+        cursor.execute("SELECT COUNT(*) FROM Users WHERE role='admin'")
+        if cursor.fetchone()[0] == 0:
+            from auth import hash_password
+            admin_password = hash_password("admin123")
+            cursor.execute("""
+            INSERT INTO Users (username, password_hash, role)
+            VALUES (%s, %s, 'admin')
+            """, ("admin", admin_password))
+        
         conn.commit()
-        return response_id
-    except sqlite3.Error as e:
-        st.error(f"حدث خطأ في حفظ الاستجابة: {str(e)}")
+        return True
+        
+    except Exception as e:
+        st.error(f"حدث خطأ في تهيئة قاعدة البيانات: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+# دوال المستخدمين
+def get_user_by_username(username):
+    """الحصول على مستخدم بواسطة اسم المستخدم"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return None
+    
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM Users WHERE username=%s", (username,))
+        return cursor.fetchone()
+    except Exception as e:
+        st.error(f"حدث خطأ في جلب بيانات المستخدم: {str(e)}")
         return None
     finally:
-        if conn:
-            conn.close()
+        conn.close()
 
-def save_response_detail(response_id, field_id, answer_value):
-    """حفظ تفاصيل الإجابة"""
-    conn = None
+def get_user_role(user_id):
+    """الحصول على دور المستخدم"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return None
+    
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        
-        c.execute(
-            "INSERT INTO Response_Details (response_id, field_id, answer_value) VALUES (?, ?, ?)",
-            (response_id, field_id, str(answer_value) if answer_value is not None else "")
-        )
-        conn.commit()
-        return True
-    except sqlite3.Error as e:
-        st.error(f"حدث خطأ في حفظ تفاصيل الإجابة: {str(e)}")
-        return False
+        cursor = conn.cursor()
+        cursor.execute("SELECT role FROM Users WHERE user_id=%s", (user_id,))
+        result = cursor.fetchone()
+        return result[0] if result else None
+    except Exception as e:
+        st.error(f"حدث خطأ في جلب دور المستخدم: {str(e)}")
+        return None
     finally:
-        if conn:
-            conn.close()
-            
-def save_survey(survey_name, fields, governorate_ids=None):
-    """حفظ استبيان جديد مع حقوله في قاعدة البيانات"""
-    conn = None
-    try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        
-        # 1. حفظ الاستبيان الأساسي
-        c.execute(
-            "INSERT INTO Surveys (survey_name, created_by) VALUES (?, ?)",
-            (survey_name, st.session_state.user_id)
-        )
-        survey_id = c.lastrowid
-        
-        # 2. ربط الاستبيان بالمحافظات
-        if governorate_ids:
-            for gov_id in governorate_ids:
-                c.execute(
-                    "INSERT INTO SurveyGovernorate (survey_id, governorate_id) VALUES (?, ?)",
-                    (survey_id, gov_id)
-                )
-        
-        # 3. حفظ حقول الاستبيان
-        for i, field in enumerate(fields):
-            field_options = json.dumps(field.get('field_options', [])) if field.get('field_options') else None
-            
-            c.execute(
-                """INSERT INTO Survey_Fields 
-                   (survey_id, field_type, field_label, field_options, is_required, field_order) 
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (survey_id, 
-                 field['field_type'], 
-                 field['field_label'],
-                 field_options,
-                 field.get('is_required', False),
-                 i + 1)
-            )
-        
-        conn.commit()
-        return True
-        
-    except sqlite3.Error as e:
-        st.error(f"حدث خطأ في حفظ الاستبيان: {str(e)}")
-        return False
-    finally:
-        if conn:
-            conn.close()
+        conn.close()
+
 def update_last_login(user_id):
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE Users SET last_login = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()            
+    """تحديث وقت آخر دخول للمستخدم"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        UPDATE Users 
+        SET last_login = CURRENT_TIMESTAMP() 
+        WHERE user_id = %s
+        """, (user_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"حدث خطأ في تحديث آخر دخول: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
 def update_user_activity(user_id):
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE Users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+    """تحديث وقت آخر نشاط للمستخدم"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        UPDATE Users 
+        SET last_activity = CURRENT_TIMESTAMP() 
+        WHERE user_id = %s
+        """, (user_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"حدث خطأ في تحديث آخر نشاط: {str(e)}")
+        return False
+    finally:
+        conn.close()
 
-def delete_survey(survey_id):
-    """حذف استبيان وجميع بياناته المرتبطة"""
-    conn = None
-    try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        
-        # حذف تفاصيل الإجابات المرتبطة
-        c.execute('''
-            DELETE FROM Response_Details 
-            WHERE response_id IN (
-                SELECT response_id FROM Responses WHERE survey_id = ?
-            )
-        ''', (survey_id,))
-        
-        # حذف الإجابات المرتبطة
-        c.execute("DELETE FROM Responses WHERE survey_id = ?", (survey_id,))
-        
-        # حذف حقول الاستبيان
-        c.execute("DELETE FROM Survey_Fields WHERE survey_id = ?", (survey_id,))
-        
-        # حذف الاستبيان نفسه
-        c.execute("DELETE FROM Surveys WHERE survey_id = ?", (survey_id,))
-        
-        conn.commit()
-        st.success("تم حذف الاستبيان بنجاح")
-        return True
-    except sqlite3.Error as e:
-        st.error(f"حدث خطأ أثناء حذف الاستبيان: {str(e)}")
+def add_user(username, password, role, region_id=None):
+    """إضافة مستخدم جديد"""
+    from auth import hash_password
+    
+    conn = get_snowflake_connection()
+    if not conn:
         return False
-    finally:
-        if conn:
-            conn.close()        
-
-def add_health_admin(admin_name, description, governorate_id):
-    """إضافة إدارة صحية جديدة إلى قاعدة البيانات مع التحقق من التكرار"""
-    conn = None
+    
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
+        cursor = conn.cursor()
         
-        # التحقق من وجود الإدارة مسبقاً في نفس المحافظة
-        c.execute("SELECT 1 FROM HealthAdministrations WHERE admin_name=? AND governorate_id=?", 
-                 (admin_name, governorate_id))
-        if c.fetchone():
-            st.error("هذه الإدارة الصحية موجودة بالفعل في هذه المحافظة!")
-            return False
-        
-        # إضافة الإدارة الجديدة
-        c.execute(
-            "INSERT INTO HealthAdministrations (admin_name, description, governorate_id) VALUES (?, ?, ?)",
-            (admin_name, description, governorate_id)
-        )
-        conn.commit()
-        st.success(f"تمت إضافة الإدارة الصحية '{admin_name}' بنجاح")
-        return True
-        
-    except sqlite3.Error as e:
-        st.error(f"حدث خطأ في قاعدة البيانات: {str(e)}")
-        return False
-    finally:
-        if conn:
-            conn.close()     
-def get_governorates_list():
-    """استرجاع قائمة المحافظات للاستخدام في القوائم المنسدلة"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("SELECT governorate_id, governorate_name FROM Governorates")
-    governorates = c.fetchall()
-    conn.close()
-    return governorates      
-def update_survey(survey_id, survey_name, is_active, fields):
-    """تحديث بيانات الاستبيان وحقوله"""
-    conn = None
-    try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        
-        # 1. تحديث بيانات الاستبيان الأساسية
-        c.execute(
-            "UPDATE Surveys SET survey_name=?, is_active=? WHERE survey_id=?",
-            (survey_name, is_active, survey_id)
-        )
-        
-        # 2. تحديث الحقول الموجودة أو إضافة جديدة
-        for field in fields:
-            field_options = json.dumps(field.get('field_options', [])) if field.get('field_options') else None
-            
-            if 'field_id' in field:  # حقل موجود يتم تحديثه
-                c.execute(
-                    """UPDATE Survey_Fields 
-                       SET field_label=?, field_type=?, field_options=?, is_required=?
-                       WHERE field_id=?""",
-                    (field['field_label'], 
-                     field['field_type'],
-                     field_options,
-                     field.get('is_required', False),
-                     field['field_id'])
-                )
-            else:  # حقل جديد يتم إضافته
-                c.execute("SELECT MAX(field_order) FROM Survey_Fields WHERE survey_id=?", (survey_id,))
-                max_order = c.fetchone()[0] or 0
-                
-                c.execute(
-                    """INSERT INTO Survey_Fields 
-                       (survey_id, field_label, field_type, field_options, is_required, field_order) 
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (survey_id,
-                     field['field_label'],
-                     field['field_type'],
-                     field_options,
-                     field.get('is_required', False),
-                     max_order + 1)
-                )
-        
-        conn.commit()
-        st.success("تم تحديث الاستبيان بنجاح")
-        return True
-        
-    except sqlite3.Error as e:
-        st.error(f"حدث خطأ في تحديث الاستبيان: {str(e)}")
-        return False
-    finally:
-        if conn:
-            conn.close()      
-def update_user(user_id, username, role, region_id=None):
-    """تحديث بيانات المستخدم"""
-    conn = None
-    try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        
-        # الحصول على القيم القديمة أولاً
-        c.execute("SELECT username, role, assigned_region FROM Users WHERE user_id=?", (user_id,))
-        old_data = c.fetchone()
-        
-        c.execute("SELECT 1 FROM Users WHERE username=? AND user_id!=?", (username, user_id))
-        if c.fetchone():
+        # التحقق من عدم وجود مستخدم بنفس الاسم
+        cursor.execute("SELECT 1 FROM Users WHERE username=%s", (username,))
+        if cursor.fetchone():
             st.error("اسم المستخدم موجود بالفعل!")
             return False
         
-        c.execute(
-            "UPDATE Users SET username=?, role=?, assigned_region=? WHERE user_id=?",
-            (username, role, region_id, user_id)
-        )
+        # إضافة المستخدم
+        cursor.execute("""
+        INSERT INTO Users (username, password_hash, role, assigned_region)
+        VALUES (%s, %s, %s, %s)
+        """, (username, hash_password(password), role, region_id))
+        
+        conn.commit()
+        st.success("تمت إضافة المستخدم بنجاح")
+        return True
+    except Exception as e:
+        st.error(f"حدث خطأ في إضافة المستخدم: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+def update_user(user_id, username, role, region_id=None):
+    """تحديث بيانات المستخدم"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
+    try:
+        cursor = conn.cursor()
+        
+        # الحصول على القيم القديمة أولاً
+        cursor.execute("""
+        SELECT username, role, assigned_region 
+        FROM Users 
+        WHERE user_id=%s
+        """, (user_id,))
+        old_data = cursor.fetchone()
+        
+        # التحقق من عدم وجود مستخدم آخر بنفس الاسم
+        cursor.execute("""
+        SELECT 1 FROM Users 
+        WHERE username=%s AND user_id!=%s
+        """, (username, user_id))
+        if cursor.fetchone():
+            st.error("اسم المستخدم موجود بالفعل!")
+            return False
+        
+        # تحديث بيانات المستخدم
+        cursor.execute("""
+        UPDATE Users 
+        SET username=%s, role=%s, assigned_region=%s 
+        WHERE user_id=%s
+        """, (username, role, region_id, user_id))
         
         if role == 'governorate_admin':
-            c.execute("DELETE FROM GovernorateAdmins WHERE user_id=?", (user_id,))
-            
+            # حذف أي تعيينات سابقة لمسؤول المحافظة
+            cursor.execute("""
+            DELETE FROM GovernorateAdmins 
+            WHERE user_id=%s
+            """, (user_id,))
+        
         conn.commit()
         
         # تسجيل التعديل في سجل التعديلات
@@ -454,221 +359,670 @@ def update_user(user_id, username, role, region_id=None):
         
         st.success("تم تحديث بيانات المستخدم بنجاح")
         return True
-    except sqlite3.Error as e:
+    except Exception as e:
         st.error(f"حدث خطأ في تحديث المستخدم: {str(e)}")
-        return False
-    finally:
-        if conn:
-            conn.close()
-
-def add_user(username, password, role, region_id=None):
-    """إضافة مستخدم جديد إلى قاعدة البيانات"""
-    from auth import hash_password
-    
-    conn = None
-    try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        
-        c.execute("SELECT 1 FROM Users WHERE username=?", (username,))
-        if c.fetchone():
-            st.error("اسم المستخدم موجود بالفعل!")
-            return False
-        
-        c.execute(
-            "INSERT INTO Users (username, password_hash, role, assigned_region) VALUES (?, ?, ?, ?)",
-            (username, hash_password(password), role, region_id)
-        )
-        conn.commit()
-        st.success("تمت إضافة المستخدم بنجاح")
-        return True
-    except sqlite3.Error as e:
-        st.error(f"حدث خطأ في إضافة المستخدم: {str(e)}")
-        return False
-    finally:
-        if conn:
-            conn.close()      
-            
-
-def get_governorate_admin(user_id):
-    conn = sqlite3.connect(DATABASE_PATH)
-    try:
-        c = conn.cursor()
-        c.execute('''
-            SELECT g.governorate_id, g.governorate_name 
-            FROM GovernorateAdmins ga
-            JOIN Governorates g ON ga.governorate_id = g.governorate_id
-            WHERE ga.user_id = ?
-        ''', (user_id,))
-        return c.fetchall()
-    finally:
-        conn.close()  
-
-# دوال مسؤول المحافظة
-def add_governorate_admin(user_id: int, governorate_id: int) -> bool:
-    """
-    إضافة مسؤول محافظة جديد
-    """
-    conn = sqlite3.connect(DATABASE_PATH)
-    try:
-        conn.execute(
-            "INSERT INTO GovernorateAdmins (user_id, governorate_id) VALUES (?, ?)",
-            (user_id, governorate_id)
-        )
-        conn.commit()
-        return True
-    except sqlite3.Error as e:
-        st.error(f"خطأ في إضافة مسؤول المحافظة: {str(e)}")
         return False
     finally:
         conn.close()
 
-def get_governorate_admin_data(user_id: int) -> tuple:
-    """
-    الحصول على بيانات مسؤول المحافظة
-    """
-    conn = sqlite3.connect(DATABASE_PATH)
+def delete_user(user_id):
+    """حذف مستخدم"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
     try:
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT g.governorate_id, g.governorate_name, g.description 
-            FROM GovernorateAdmins ga
-            JOIN Governorates g ON ga.governorate_id = g.governorate_id
-            WHERE ga.user_id = ?
-        ''', (user_id,))
+        
+        # التحقق من وجود إجابات مرتبطة بالمستخدم
+        cursor.execute("SELECT 1 FROM Responses WHERE user_id=%s", (user_id,))
+        if cursor.fetchone():
+            st.error("لا يمكن حذف المستخدم لأنه لديه إجابات مسجلة!")
+            return False
+        
+        # حذف المستخدم
+        cursor.execute("DELETE FROM Users WHERE user_id=%s", (user_id,))
+        conn.commit()
+        st.success("تم حذف المستخدم بنجاح")
+        return True
+    except Exception as e:
+        st.error(f"حدث خطأ أثناء حذف المستخدم: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+# دوال المحافظات والإدارات الصحية
+def get_governorates_list():
+    """الحصول على قائمة المحافظات"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return []
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT governorate_id, governorate_name 
+        FROM Governorates
+        ORDER BY governorate_name
+        """)
+        return cursor.fetchall()
+    except Exception as e:
+        st.error(f"حدث خطأ في جلب قائمة المحافظات: {str(e)}")
+        return []
+    finally:
+        conn.close()
+
+def get_health_admins():
+    """الحصول على قائمة الإدارات الصحية"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return []
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT admin_id, admin_name 
+        FROM HealthAdministrations
+        ORDER BY admin_name
+        """)
+        return cursor.fetchall()
+    except Exception as e:
+        st.error(f"حدث خطأ في جلب قائمة الإدارات الصحية: {str(e)}")
+        return []
+    finally:
+        conn.close()
+
+def get_health_admin_name(admin_id):
+    """الحصول على اسم الإدارة الصحية"""
+    if admin_id is None:
+        return "غير معين"
+    
+    conn = get_snowflake_connection()
+    if not conn:
+        return "خطأ في النظام"
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT admin_name 
+        FROM HealthAdministrations 
+        WHERE admin_id=%s
+        """, (admin_id,))
+        result = cursor.fetchone()
+        return result[0] if result else "غير معروف"
+    except Exception as e:
+        st.error(f"حدث خطأ في جلب اسم الإدارة الصحية: {str(e)}")
+        return "خطأ في النظام"
+    finally:
+        conn.close()
+
+def add_health_admin(admin_name, description, governorate_id):
+    """إضافة إدارة صحية جديدة"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
+    try:
+        cursor = conn.cursor()
+        
+        # التحقق من عدم وجود إدارة بنفس الاسم في نفس المحافظة
+        cursor.execute("""
+        SELECT 1 FROM HealthAdministrations 
+        WHERE admin_name=%s AND governorate_id=%s
+        """, (admin_name, governorate_id))
+        if cursor.fetchone():
+            st.error("هذه الإدارة الصحية موجودة بالفعل في هذه المحافظة!")
+            return False
+        
+        # إضافة الإدارة الجديدة
+        cursor.execute("""
+        INSERT INTO HealthAdministrations (admin_name, description, governorate_id)
+        VALUES (%s, %s, %s)
+        """, (admin_name, description, governorate_id))
+        
+        conn.commit()
+        st.success(f"تمت إضافة الإدارة الصحية '{admin_name}' بنجاح")
+        return True
+    except Exception as e:
+        st.error(f"حدث خطأ في إضافة الإدارة الصحية: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+def update_health_admin(admin_id, admin_name, description, governorate_id):
+    """تحديث بيانات الإدارة الصحية"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
+    try:
+        cursor = conn.cursor()
+        
+        # التحقق من عدم وجود إدارة أخرى بنفس الاسم في نفس المحافظة
+        cursor.execute("""
+        SELECT 1 FROM HealthAdministrations 
+        WHERE admin_name=%s AND governorate_id=%s AND admin_id!=%s
+        """, (admin_name, governorate_id, admin_id))
+        if cursor.fetchone():
+            st.error("هذا الاسم مستخدم بالفعل لإدارة أخرى في هذه المحافظة!")
+            return False
+        
+        # تحديث بيانات الإدارة
+        cursor.execute("""
+        UPDATE HealthAdministrations 
+        SET admin_name=%s, description=%s, governorate_id=%s 
+        WHERE admin_id=%s
+        """, (admin_name, description, governorate_id, admin_id))
+        
+        conn.commit()
+        st.success("تم تحديث الإدارة الصحية بنجاح")
+        return True
+    except Exception as e:
+        st.error(f"حدث خطأ في تحديث الإدارة الصحية: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+def delete_health_admin(admin_id):
+    """حذف إدارة صحية"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
+    try:
+        cursor = conn.cursor()
+        
+        # التحقق من عدم وجود مستخدمين مرتبطين بالإدارة
+        cursor.execute("SELECT 1 FROM Users WHERE assigned_region=%s", (admin_id,))
+        if cursor.fetchone():
+            st.error("لا يمكن حذف الإدارة الصحية لأنها مرتبطة بمستخدمين!")
+            return False
+        
+        # حذف الإدارة
+        cursor.execute("DELETE FROM HealthAdministrations WHERE admin_id=%s", (admin_id,))
+        conn.commit()
+        st.success("تم حذف الإدارة الصحية بنجاح")
+        return True
+    except Exception as e:
+        st.error(f"حدث خطأ أثناء حذف الإدارة الصحية: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+# دوال مسؤولي المحافظات
+def get_governorate_admin(user_id):
+    """الحصول على محافظات مسؤول المحافظة"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return []
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT g.governorate_id, g.governorate_name 
+        FROM GovernorateAdmins ga
+        JOIN Governorates g ON ga.governorate_id = g.governorate_id
+        WHERE ga.user_id = %s
+        """, (user_id,))
+        return cursor.fetchall()
+    except Exception as e:
+        st.error(f"حدث خطأ في جلب محافظات المسؤول: {str(e)}")
+        return []
+    finally:
+        conn.close()
+
+def get_governorate_admin_data(user_id):
+    """الحصول على بيانات مسؤول المحافظة"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return None
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT g.governorate_id, g.governorate_name, g.description 
+        FROM GovernorateAdmins ga
+        JOIN Governorates g ON ga.governorate_id = g.governorate_id
+        WHERE ga.user_id = %s
+        """, (user_id,))
         return cursor.fetchone()
-    except sqlite3.Error as e:
-        st.error(f"خطأ في جلب بيانات المحافظة: {str(e)}")
+    except Exception as e:
+        st.error(f"حدث خطأ في جلب بيانات المحافظة: {str(e)}")
         return None
     finally:
         conn.close()
 
-def get_governorate_surveys(governorate_id: int) -> list:
-    """
-    الحصول على الاستبيانات الخاصة بمحافظة معينة
-    """
-    conn = sqlite3.connect(DATABASE_PATH)
+def add_governorate_admin(user_id, governorate_id):
+    """إضافة مسؤول محافظة"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
     try:
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT s.survey_id, s.survey_name, s.created_at, s.is_active
-            FROM Surveys s
-            JOIN SurveyGovernorate sg ON s.survey_id = sg.survey_id
-            WHERE sg.governorate_id = ?
-            ORDER BY s.created_at DESC
-        ''', (governorate_id,))
-        return cursor.fetchall()
+        cursor.execute("""
+        INSERT INTO GovernorateAdmins (user_id, governorate_id)
+        VALUES (%s, %s)
+        """, (user_id, governorate_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"حدث خطأ في إضافة مسؤول المحافظة: {str(e)}")
+        return False
     finally:
         conn.close()
 
-def get_governorate_employees(governorate_id: int) -> list:
-    """
-    الحصول على الموظفين التابعين لمحافظة معينة
-    """
-    conn = sqlite3.connect(DATABASE_PATH)
-    try:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT u.user_id, u.username, ha.admin_name
-            FROM Users u
-            JOIN HealthAdministrations ha ON u.assigned_region = ha.admin_id
-            WHERE ha.governorate_id = ? AND u.role = 'employee'
-            ORDER BY u.username
-        ''', (governorate_id,))
-        return cursor.fetchall()
-    finally:
-        conn.close()        
-        
-def get_allowed_surveys(user_id: int) -> List[Tuple[int, str]]:
-    """الحصول على الاستبيانات المسموح بها للموظف"""
-    conn = sqlite3.connect(DATABASE_PATH)
+# دوال الاستبيانات
+def save_survey(survey_name, fields, governorate_ids=None):
+    """حفظ استبيان جديد"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
     try:
         cursor = conn.cursor()
         
-        # الحصول على المحافظة التابعة للمستخدم
-        cursor.execute('''
-            SELECT ha.governorate_id 
-            FROM Users u
-            JOIN HealthAdministrations ha ON u.assigned_region = ha.admin_id
-            WHERE u.user_id = ?
-        ''', (user_id,))
-        governorate_id = cursor.fetchone()
+        # 1. حفظ الاستبيان الأساسي
+        cursor.execute("""
+        INSERT INTO Surveys (survey_name, created_by)
+        VALUES (%s, %s)
+        """, (survey_name, st.session_state.user_id))
         
-        if not governorate_id:
-            return []
+        # الحصول على معرف الاستبيان الجديد
+        cursor.execute("SELECT LAST_INSERT_ID()")
+        survey_id = cursor.fetchone()[0]
+        
+        # 2. ربط الاستبيان بالمحافظات
+        if governorate_ids:
+            for gov_id in governorate_ids:
+                cursor.execute("""
+                INSERT INTO SurveyGovernorate (survey_id, governorate_id)
+                VALUES (%s, %s)
+                """, (survey_id, gov_id))
+        
+        # 3. حفظ حقول الاستبيان
+        for i, field in enumerate(fields):
+            field_options = json.dumps(field.get('field_options', [])) if field.get('field_options') else None
             
-        # الحصول على الاستبيانات المسموحة للمحافظة
-        cursor.execute('''
-            SELECT s.survey_id, s.survey_name
-            FROM Surveys s
-            JOIN SurveyGovernorate sg ON s.survey_id = sg.survey_id
-            WHERE sg.governorate_id = ?
-            ORDER BY s.survey_name
-        ''', (governorate_id[0],))
+            cursor.execute("""
+            INSERT INTO Survey_Fields (
+                survey_id, field_type, field_label, 
+                field_options, is_required, field_order
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                survey_id, 
+                field['field_type'], 
+                field['field_label'],
+                field_options,
+                field.get('is_required', False),
+                i + 1
+            ))
         
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"حدث خطأ في حفظ الاستبيان: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+def get_governorate_surveys(governorate_id):
+    """الحصول على استبيانات المحافظة"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return []
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT s.survey_id, s.survey_name, s.created_at, s.is_active
+        FROM Surveys s
+        JOIN SurveyGovernorate sg ON s.survey_id = sg.survey_id
+        WHERE sg.governorate_id = %s
+        ORDER BY s.created_at DESC
+        """, (governorate_id,))
         return cursor.fetchall()
-    except sqlite3.Error as e:
-        st.error(f"حدث خطأ في جلب الاستبيانات المسموح بها: {str(e)}")
+    except Exception as e:
+        st.error(f"حدث خطأ في جلب استبيانات المحافظة: {str(e)}")
         return []
     finally:
-        conn.close()       
-        
-def get_survey_fields(survey_id: int) -> List[Tuple]:
-    """الحصول على حقول استبيان معين"""
-    conn = sqlite3.connect(DATABASE_PATH)
+        conn.close()
+
+def get_survey_fields(survey_id):
+    """الحصول على حقول الاستبيان"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return []
+    
     try:
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT 
-                field_id, 
-                field_label, 
-                field_type, 
-                field_options, 
-                is_required, 
-                field_order
-            FROM Survey_Fields
-            WHERE survey_id = ?
-            ORDER BY field_order
-        ''', (survey_id,))
+        cursor.execute("""
+        SELECT 
+            field_id, 
+            field_label, 
+            field_type, 
+            field_options, 
+            is_required, 
+            field_order
+        FROM Survey_Fields
+        WHERE survey_id = %s
+        ORDER BY field_order
+        """, (survey_id,))
         return cursor.fetchall()
-    except sqlite3.Error as e:
+    except Exception as e:
         st.error(f"حدث خطأ في جلب حقول الاستبيان: {str(e)}")
         return []
     finally:
         conn.close()
-        
-def get_user_allowed_surveys(user_id: int) -> List[Tuple[int, str]]:
-    """الحصول على الاستبيانات المسموح بها للمستخدم"""
-    conn = sqlite3.connect(DATABASE_PATH)
+
+def update_survey(survey_id, survey_name, is_active, fields):
+    """تحديث بيانات الاستبيان"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
     try:
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT s.survey_id, s.survey_name 
-            FROM Surveys s
-            JOIN UserSurveys us ON s.survey_id = us.survey_id
-            WHERE us.user_id = ?
-            ORDER BY s.survey_name
-        ''', (user_id,))
+        
+        # 1. تحديث بيانات الاستبيان الأساسية
+        cursor.execute("""
+        UPDATE Surveys 
+        SET survey_name=%s, is_active=%s 
+        WHERE survey_id=%s
+        """, (survey_name, is_active, survey_id))
+        
+        # 2. تحديث الحقول الموجودة أو إضافة جديدة
+        for field in fields:
+            field_options = json.dumps(field.get('field_options', [])) if field.get('field_options') else None
+            
+            if 'field_id' in field:  # حقل موجود يتم تحديثه
+                cursor.execute("""
+                UPDATE Survey_Fields 
+                SET field_label=%s, field_type=%s, field_options=%s, is_required=%s
+                WHERE field_id=%s
+                """, (
+                    field['field_label'], 
+                    field['field_type'],
+                    field_options,
+                    field.get('is_required', False),
+                    field['field_id']
+                ))
+            else:  # حقل جديد يتم إضافته
+                cursor.execute("""
+                SELECT MAX(field_order) 
+                FROM Survey_Fields 
+                WHERE survey_id=%s
+                """, (survey_id,))
+                max_order = cursor.fetchone()[0] or 0
+                
+                cursor.execute("""
+                INSERT INTO Survey_Fields (
+                    survey_id, field_label, field_type, 
+                    field_options, is_required, field_order
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """, (
+                    survey_id,
+                    field['field_label'],
+                    field['field_type'],
+                    field_options,
+                    field.get('is_required', False),
+                    max_order + 1
+                ))
+        
+        conn.commit()
+        st.success("تم تحديث الاستبيان بنجاح")
+        return True
+    except Exception as e:
+        st.error(f"حدث خطأ في تحديث الاستبيان: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+def delete_survey(survey_id):
+    """حذف استبيان"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
+    try:
+        cursor = conn.cursor()
+        
+        # حذف تفاصيل الإجابات المرتبطة
+        cursor.execute("""
+        DELETE FROM Response_Details 
+        WHERE response_id IN (
+            SELECT response_id FROM Responses WHERE survey_id = %s
+        )
+        """, (survey_id,))
+        
+        # حذف الإجابات المرتبطة
+        cursor.execute("""
+        DELETE FROM Responses 
+        WHERE survey_id = %s
+        """, (survey_id,))
+        
+        # حذف حقول الاستبيان
+        cursor.execute("""
+        DELETE FROM Survey_Fields 
+        WHERE survey_id = %s
+        """, (survey_id,))
+        
+        # حذف الاستبيان نفسه
+        cursor.execute("""
+        DELETE FROM Surveys 
+        WHERE survey_id = %s
+        """, (survey_id,))
+        
+        conn.commit()
+        st.success("تم حذف الاستبيان بنجاح")
+        return True
+    except Exception as e:
+        st.error(f"حدث خطأ أثناء حذف الاستبيان: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+# دوال الإجابات
+def save_response(survey_id, user_id, region_id, is_completed=False):
+    """حفظ إجابة جديدة"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return None
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        INSERT INTO Responses (survey_id, user_id, region_id, is_completed)
+        VALUES (%s, %s, %s, %s)
+        """, (survey_id, user_id, region_id, is_completed))
+        
+        # الحصول على معرف الإجابة الجديدة
+        cursor.execute("SELECT LAST_INSERT_ID()")
+        response_id = cursor.fetchone()[0]
+        
+        conn.commit()
+        return response_id
+    except Exception as e:
+        st.error(f"حدث خطأ في حفظ الإجابة: {str(e)}")
+        return None
+    finally:
+        conn.close()
+
+def save_response_detail(response_id, field_id, answer_value):
+    """حفظ تفاصيل الإجابة"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        INSERT INTO Response_Details (response_id, field_id, answer_value)
+        VALUES (%s, %s, %s)
+        """, (response_id, field_id, str(answer_value) if answer_value is not None else ""))
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"حدث خطأ في حفظ تفاصيل الإجابة: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+def get_response_info(response_id):
+    """الحصول على معلومات أساسية عن الإجابة"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return None
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT 
+            r.response_id, s.survey_name, u.username, 
+            ha.admin_name, g.governorate_name, r.submission_date
+        FROM Responses r
+        JOIN Surveys s ON r.survey_id = s.survey_id
+        JOIN Users u ON r.user_id = u.user_id
+        JOIN HealthAdministrations ha ON r.region_id = ha.admin_id
+        JOIN Governorates g ON ha.governorate_id = g.governorate_id
+        WHERE r.response_id = %s
+        """, (response_id,))
+        return cursor.fetchone()
+    except Exception as e:
+        st.error(f"حدث خطأ في جلب معلومات الإجابة: {str(e)}")
+        return None
+    finally:
+        conn.close()
+
+def get_response_details(response_id):
+    """الحصول على تفاصيل الإجابة"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return []
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT 
+            rd.detail_id, rd.field_id, sf.field_label, 
+            sf.field_type, sf.field_options, rd.answer_value
+        FROM Response_Details rd
+        JOIN Survey_Fields sf ON rd.field_id = sf.field_id
+        WHERE rd.response_id = %s
+        ORDER BY sf.field_order
+        """, (response_id,))
         return cursor.fetchall()
-    except sqlite3.Error as e:
+    except Exception as e:
+        st.error(f"حدث خطأ في جلب تفاصيل الإجابة: {str(e)}")
+        return []
+    finally:
+        conn.close()
+
+def update_response_detail(detail_id, new_value):
+    """تحديث تفاصيل الإجابة"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        UPDATE Response_Details 
+        SET answer_value = %s 
+        WHERE detail_id = %s
+        """, (new_value, detail_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"حدث خطأ في تحديث الإجابة: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+def has_completed_survey_today(user_id, survey_id):
+    """التحقق من إكمال الاستبيان اليوم"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT 1 FROM Responses 
+        WHERE user_id = %s AND survey_id = %s AND is_completed = TRUE
+        AND DATE(submission_date) = CURRENT_DATE()
+        LIMIT 1
+        """, (user_id, survey_id))
+        return cursor.fetchone() is not None
+    except Exception as e:
+        st.error(f"حدث خطأ في التحقق من إكمال الاستبيان: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+# دوال الموظفين
+def get_governorate_employees(governorate_id):
+    """الحصول على موظفي المحافظة"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return []
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT u.user_id, u.username, ha.admin_name
+        FROM Users u
+        JOIN HealthAdministrations ha ON u.assigned_region = ha.admin_id
+        WHERE ha.governorate_id = %s AND u.role = 'employee'
+        ORDER BY u.username
+        """, (governorate_id,))
+        return cursor.fetchall()
+    except Exception as e:
+        st.error(f"حدث خطأ في جلب موظفي المحافظة: {str(e)}")
+        return []
+    finally:
+        conn.close()
+
+def get_user_allowed_surveys(user_id):
+    """الحصول على الاستبيانات المسموح بها للمستخدم"""
+    conn = get_snowflake_connection()
+    if not conn:
+        return []
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT s.survey_id, s.survey_name 
+        FROM Surveys s
+        JOIN UserSurveys us ON s.survey_id = us.survey_id
+        WHERE us.user_id = %s
+        ORDER BY s.survey_name
+        """, (user_id,))
+        return cursor.fetchall()
+    except Exception as e:
         st.error(f"حدث خطأ في جلب الاستبيانات المسموح بها: {str(e)}")
         return []
     finally:
         conn.close()
 
-def update_user_allowed_surveys(user_id: int, survey_ids: List[int]) -> bool:
+def update_user_allowed_surveys(user_id, survey_ids):
     """تحديث الاستبيانات المسموح بها للمستخدم"""
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
     try:
         cursor = conn.cursor()
         
         # الحصول على محافظة المستخدم
-        cursor.execute('''
-            SELECT ha.governorate_id 
-            FROM Users u
-            JOIN HealthAdministrations ha ON u.assigned_region = ha.admin_id
-            WHERE u.user_id = ?
-        ''', (user_id,))
+        cursor.execute("""
+        SELECT ha.governorate_id 
+        FROM Users u
+        JOIN HealthAdministrations ha ON u.assigned_region = ha.admin_id
+        WHERE u.user_id = %s
+        """, (user_id,))
         governorate_id = cursor.fetchone()
         
         if not governorate_id:
@@ -678,152 +1032,101 @@ def update_user_allowed_surveys(user_id: int, survey_ids: List[int]) -> bool:
         # التحقق من أن الاستبيانات مسموحة للمحافظة
         valid_surveys = []
         for survey_id in survey_ids:
-            cursor.execute('''
-                SELECT 1 FROM SurveyGovernorate 
-                WHERE survey_id = ? AND governorate_id = ?
-            ''', (survey_id, governorate_id[0]))
+            cursor.execute("""
+            SELECT 1 FROM SurveyGovernorate 
+            WHERE survey_id = %s AND governorate_id = %s
+            """, (survey_id, governorate_id[0]))
             if cursor.fetchone():
                 valid_surveys.append(survey_id)
         
         # حذف جميع التصاريح الحالية
-        cursor.execute("DELETE FROM UserSurveys WHERE user_id=?", (user_id,))
+        cursor.execute("DELETE FROM UserSurveys WHERE user_id=%s", (user_id,))
         
         # إضافة التصاريح الجديدة
         for survey_id in valid_surveys:
-            cursor.execute(
-                "INSERT INTO UserSurveys (user_id, survey_id) VALUES (?, ?)",
-                (user_id, survey_id))
+            cursor.execute("""
+            INSERT INTO UserSurveys (user_id, survey_id)
+            VALUES (%s, %s)
+            """, (user_id, survey_id))
         
         conn.commit()
         return True
-    except sqlite3.Error as e:
+    except Exception as e:
         st.error(f"حدث خطأ في تحديث الاستبيانات المسموح بها: {str(e)}")
         return False
     finally:
         conn.close()
-        
-def get_response_details(response_id: int) -> List[Tuple]:
-    """الحصول على تفاصيل إجابة محددة"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    try:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT rd.detail_id, rd.field_id, sf.field_label, 
-                   sf.field_type, sf.field_options, rd.answer_value
-            FROM Response_Details rd
-            JOIN Survey_Fields sf ON rd.field_id = sf.field_id
-            WHERE rd.response_id = ?
-            ORDER BY sf.field_order
-        ''', (response_id,))
-        return cursor.fetchall()
-    except sqlite3.Error as e:
-        st.error(f"حدث خطأ في جلب تفاصيل الإجابة: {str(e)}")
-        return []
-    finally:
-        conn.close()
 
-def update_response_detail(detail_id: int, new_value: str) -> bool:
-    """تحديث قيمة إجابة محددة"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE Response_Details SET answer_value = ? WHERE detail_id = ?",
-            (new_value, detail_id)
-        )
-        conn.commit()
-        return True
-    except sqlite3.Error as e:
-        st.error(f"حدث خطأ في تحديث الإجابة: {str(e)}")
-        return False
-    finally:
-        conn.close()
-
-def get_response_info(response_id: int) -> Optional[Tuple]:
-    """الحصول على معلومات أساسية عن الإجابة"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    try:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT r.response_id, s.survey_name, u.username, 
-                   ha.admin_name, g.governorate_name, r.submission_date
-            FROM Responses r
-            JOIN Surveys s ON r.survey_id = s.survey_id
-            JOIN Users u ON r.user_id = u.user_id
-            JOIN HealthAdministrations ha ON r.region_id = ha.admin_id
-            JOIN Governorates g ON ha.governorate_id = g.governorate_id
-            WHERE r.response_id = ?
-        ''', (response_id,))
-        return cursor.fetchone()
-    except sqlite3.Error as e:
-        st.error(f"حدث خطأ في جلب معلومات الإجابة: {str(e)}")
-        return None
-    finally:
-        conn.close()        
-        
-def log_audit_action(user_id: int, action_type: str, table_name: str, 
-                    record_id: int = None, old_value: str = None, 
-                    new_value: str = None) -> bool:
+# دوال سجل التعديلات
+def log_audit_action(user_id, action_type, table_name, record_id=None, old_value=None, new_value=None):
     """تسجيل إجراء في سجل التعديلات"""
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = get_snowflake_connection()
+    if not conn:
+        return False
+    
     try:
-        conn.execute(
-            """INSERT INTO AuditLog 
-               (user_id, action_type, table_name, record_id, old_value, new_value)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (user_id, action_type, table_name, record_id, 
-             json.dumps(old_value) if old_value else None,
-             json.dumps(new_value) if new_value else None)
+        cursor = conn.cursor()
+        cursor.execute("""
+        INSERT INTO AuditLog (
+            user_id, action_type, table_name, 
+            record_id, old_value, new_value
         )
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """, (
+            user_id, 
+            action_type, 
+            table_name, 
+            record_id,
+            json.dumps(old_value) if old_value else None,
+            json.dumps(new_value) if new_value else None
+        ))
         conn.commit()
         return True
-    except sqlite3.Error as e:
+    except Exception as e:
         st.error(f"حدث خطأ في تسجيل الإجراء: {str(e)}")
         return False
     finally:
         conn.close()
 
-def get_audit_logs(
-    table_name: str = None, 
-    action_type: str = None,
-    username: str = None,
-    date_range: tuple = None,
-    search_query: str = None
-) -> List[Tuple]:
+def get_audit_logs(table_name=None, action_type=None, username=None, date_range=None, search_query=None):
     """الحصول على سجل التعديلات مع فلاتر متقدمة"""
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = get_snowflake_connection()
+    if not conn:
+        return []
+    
     try:
         cursor = conn.cursor()
-        query = '''
-            SELECT a.log_id, u.username, a.action_type, a.table_name, 
-                   a.record_id, a.old_value, a.new_value, a.action_timestamp
-            FROM AuditLog a
-            JOIN Users u ON a.user_id = u.user_id
-        '''
+        query = """
+        SELECT 
+            a.log_id, u.username, a.action_type, a.table_name, 
+            a.record_id, a.old_value, a.new_value, a.action_timestamp
+        FROM AuditLog a
+        JOIN Users u ON a.user_id = u.user_id
+        """
         params = []
         conditions = []
         
         # تطبيق الفلاتر
         if table_name:
-            conditions.append("a.table_name = ?")
+            conditions.append("a.table_name = %s")
             params.append(table_name)
         if action_type:
-            conditions.append("a.action_type = ?")
+            conditions.append("a.action_type = %s")
             params.append(action_type)
         if username:
-            conditions.append("u.username LIKE ?")
+            conditions.append("u.username LIKE %s")
             params.append(f"%{username}%")
         if date_range and len(date_range) == 2:
             start_date, end_date = date_range
-            conditions.append("DATE(a.action_timestamp) BETWEEN ? AND ?")
+            conditions.append("DATE(a.action_timestamp) BETWEEN %s AND %s")
             params.extend([start_date, end_date])
         if search_query:
             conditions.append("""
-                (a.old_value LIKE ? OR 
-                 a.new_value LIKE ? OR 
-                 u.username LIKE ? OR 
-                 a.table_name LIKE ? OR
-                 a.action_type LIKE ?)
+            (a.old_value LIKE %s OR 
+             a.new_value LIKE %s OR 
+             u.username LIKE %s OR 
+             a.table_name LIKE %s OR
+             a.action_type LIKE %s)
             """)
             search_term = f"%{search_query}%"
             params.extend([search_term, search_term, search_term, search_term, search_term])
@@ -835,26 +1138,8 @@ def get_audit_logs(
         
         cursor.execute(query, params)
         return cursor.fetchall()
-    except sqlite3.Error as e:
+    except Exception as e:
         st.error(f"حدث خطأ في جلب سجل التعديلات: {str(e)}")
         return []
     finally:
         conn.close()
-        
-def has_completed_survey_today(user_id: int, survey_id: int) -> bool:
-    """التحقق مما إذا كان المستخدم قد أكمل الاستبيان اليوم"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    try:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT 1 FROM Responses 
-            WHERE user_id = ? AND survey_id = ? AND is_completed = TRUE
-            AND DATE(submission_date) = DATE('now')
-            LIMIT 1
-        ''', (user_id, survey_id))
-        return cursor.fetchone() is not None
-    except sqlite3.Error as e:
-        st.error(f"حدث خطأ في التحقق من إكمال الاستبيان: {str(e)}")
-        return False
-    finally:
-        conn.close()        
