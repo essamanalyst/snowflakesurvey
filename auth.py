@@ -9,6 +9,7 @@ def authenticate():
         if 'last_activity' in st.session_state:
             if (datetime.now() - st.session_state.last_activity) < timedelta(hours=1):
                 st.session_state.last_activity = datetime.now()  # تجديد النشاط
+                update_user_activity(st.session_state.user_id)
                 return True
             else:
                 logout()  # انتهت مدة الجلسة
